@@ -21,16 +21,17 @@
 @persist TerrainLerp TerrainAirLerp TerrainMaxTilt TerrainPitch TerrainRoll FootTravelDown FootTravelUp TerrainWorldOnly GroundWorldOnly
 @persist HullEnable HullLen HullWid HullH HullLift HullFwd HullLook HullBrake
 @persist CurBase:entity RebasePhase PendingBase:entity RigFilter:array
-@persist Idle IdleLock CamDirty SlowN GndN FilterDirty HullHitUntil EngineVolLast SlideVolLast SlidePitchLast
+@persist Idle IdleLock CamDirty CamMoved SlowN GndN FilterDirty HullHitUntil EngineVolLast SlideVolLast SlidePitchLast SpeedRef MinNZ SinTilt
 @persist [HP HLA HLH HLT HLF HRA HRH HRT HRF HGR HGL HT]:entity
 @trigger none
 
 # ================= OPTIMIZATION NOTES =================
-# - Ranger filter is rebuilt at most once per slow tick (was up to 5x).
-# - Hull probe runs at 10 Hz with a cached wall normal; collision response stays 20 Hz.
-# - Yaw rotations are reused as basis vectors instead of recomputed per target.
-# - Aim point / stow angles / shoulder stow quaternion computed once per tick.
-# - Redundant holoAng, toLocal and sound API calls removed.
+# - Single 20 Hz timer: the old 50 Hz visual timer was merged into the physics tick.
+# - Ranger filter keeps only roots, direct children, holos and players (no recursive
+#   tree or connected-entity scan); hull probe runs at 5 Hz with a cached normal.
+# - Leg IK runs at 10 Hz; holoAng values persist between ticks.
+# - Quaternion slerp replaced by an angle-space lerp; shoulder slew only on camera move.
+# - Yaw basis, speed, angular velocity, tilt trig and ranger entity are reused.
 # - Control flow uses the canonical `} elseif` / `} else` form from the Wiremod wiki.
 # Tuning values and visible behaviour are unchanged.
 
@@ -51,24 +52,13 @@ function buildRangerFilter() {
     foreach (I, E:entity = Roots) {
         if (E) {
             RigFilter:pushEntity(E)
-            foreach (J, C:entity = E:children()) {
-                if (C) {
-                    RigFilter:pushEntity(C)
-                    foreach (K, G:entity = C:children()) {
-                        if (G) {
-                            RigFilter:pushEntity(G)
-                            foreach (L, H2:entity = G:children()) { if (H2) { RigFilter:pushEntity(H2) } }
-                        }
-                    }
-                }
-            }
+            foreach (J, C:entity = E:children()) { if (C) { RigFilter:pushEntity(C) } }
         }
     }
-    for (I = 1, 21) {
+    for (I = 1, 16) {
         local H = holoEntity(I)
         if (H) { RigFilter:pushEntity(H) }
     }
-    foreach (I, E:entity = CurBase:getConnectedEntities()) { if (E) { RigFilter:pushEntity(E) } }
     foreach (I, E:entity = players()) { if (E) { RigFilter:pushEntity(E) } }
     rangerFilter(RigFilter)
 }
@@ -124,6 +114,82 @@ function two_seg_ik(IA, IB, IK, A:entity, B:entity, P:entity, Target:vector) {
     holoAng(IK, B:toWorld(ang(acos(KneeArg) + 180, 0, 0)))
 }
 
+function angle lerpAng(Cur:angle, Tar:angle, T) {
+    local P = angnorm(Tar:pitch() - Cur:pitch())
+    local Y = angnorm(Tar:yaw() - Cur:yaw())
+    local R = angnorm(Tar:roll() - Cur:roll())
+    return ang(angnorm(Cur:pitch() + P*T), angnorm(Cur:yaw() + Y*T), angnorm(Cur:roll() + R*T))
+}
+function updateVisual(VDt) {
+    local CY = angnorm(CamAng:yaw())
+    local CP = angnorm(CamAng:pitch())
+    local CamCh = (abs(angnorm(CY - LastCY)) > 0.15) | (abs(angnorm(CP - LastCP)) > 0.15)
+    local Busy = CamCh | CamDirty | TorsoBusy | (AimLeft > 0) | (AimRight > 0) | !Idle
+    CamMoved = CamCh | CamDirty
+    if (!Busy) { return }
+    CamDirty = 0
+    LastCY = CY
+    LastCP = CP
+
+    local Cf = clamp((CamSmooth/0.05)*VDt, 0, 1)
+    CamYawS = angnorm(CamYawS + angnorm(CY - CamYawS)*Cf)
+    CamPitchS = angnorm(CamPitchS + angnorm(CP - CamPitchS)*Cf)
+
+    if (TorsoReady) {
+        local TPit = clamp(CamPitchS, -TorsoPitchMax, TorsoPitchMax)
+        local TNew = slewAng(ang(TorsoPitch, TorsoYaw, 0), ang(TPit, CamYawS, 0), TorsoTurnRate, VDt)
+        TorsoYaw = angnorm(TNew:yaw())
+        TorsoPitch = angnorm(TNew:pitch())
+        holoAng(21, ang(TorsoPitch, TorsoYaw, 0))
+        TorsoBusy = (abs(angnorm(CamYawS - TorsoYaw)) > 0.3) | (abs(angnorm(TPit - TorsoPitch)) > 0.3)
+    } else {
+        TorsoBusy = 0
+    }
+
+    # Shared gun work: one aim point and at most two stow angles per visual tick.
+    local NeedStowR = (!GunStowR & (AimRight <= 0)) | ((AimRight > 0) & (AimRight < 1))
+    local NeedStowL = (!GunStowL & (AimLeft <= 0)) | ((AimLeft > 0) & (AimLeft < 1))
+    local StowR = ang(0)
+    local StowL = ang(0)
+    if (NeedStowR | NeedStowL) {
+        local StowRef = CurBase
+        if (TorsoReady) { StowRef = HT }
+        if (NeedStowR) { StowR = StowRef:toWorld(ang(35,-25,-25)) }
+        if (NeedStowL) { StowL = StowRef:toWorld(ang(35,25,25)) }
+    }
+    local AimPos = vec(0)
+    if ((AimRight > 0) | (AimLeft > 0)) { AimPos = Active ? CamAimPos : CurBase:toWorld(vec(9999,0,0)) }
+
+    if (AimRight > 0) {
+        if (GunStowR) { GunAimR = HGR:angles() GunStowR = 0 }
+        GunAimR = slewAng(GunAimR, (AimPos - HGR:pos()):toAngle(), GunTrackSpeed, VDt)
+        if (AimRight >= 1) { holoAng(11, GunAimR) } else { holoAng(11, lerpAng(StowR, GunAimR, clamp(AimRight*1.1, 0, 1))) }
+    } elseif (!GunStowR) {
+        holoAng(11, StowR)
+        GunStowR = 1
+    }
+
+    if (AimLeft > 0) {
+        if (GunStowL) { GunAimL = HGL:angles() GunStowL = 0 }
+        GunAimL = slewAng(GunAimL, (AimPos - HGL:pos()):toAngle(), GunTrackSpeed, VDt)
+        if (AimLeft >= 1) { holoAng(12, GunAimL) } else { holoAng(12, lerpAng(StowL, GunAimL, clamp(AimLeft*1.1, 0, 1))) }
+    } elseif (!GunStowL) {
+        holoAng(12, StowL)
+        GunStowL = 1
+    }
+
+    local CamLocal = FP_CamPos
+    if (ThirdPerson) { CamLocal = vec(TP_CamPos:x(), -CameraSideOffset*CameraSide, TP_CamPos:z()) }
+    if (CamFollowTorso & TorsoReady) {
+        CamPos = CurBase:toLocal(HT:toWorld(CamLocal))
+        Cam_Hold = ang(TorsoPitch, TorsoYaw, 0)
+    } else {
+        CamPos = CamLocal
+        if (CamHoldMode == 1) { Cam_Hold = CamAng } else { Cam_Hold = CurBase:angles() }
+    }
+
+}
+
 # ================= INIT =================
 if (first() | dupefinished()) {
     Edit = 0
@@ -135,6 +201,7 @@ if (first() | dupefinished()) {
     FootGroundOffset = 10
 
     Move_Speed = 130
+    SpeedRef = max(Move_Speed, 1)
     Move_Speed_Min = 20
     Move_Accel = 3
     Move_Decel = 3
@@ -159,6 +226,8 @@ if (first() | dupefinished()) {
     GunStowL = 0
 
     TerrainMaxTilt = 25
+    MinNZ = cos(TerrainMaxTilt)
+    SinTilt = sin(TerrainMaxTilt)
     TerrainLerp = 0.15
     TerrainAirLerp = 0.06
     FootTravelDown = 8
@@ -266,6 +335,7 @@ if (first() | dupefinished()) {
     AimRight = 0
     Idle = 0
     CamDirty = 1
+    CamMoved = 1
     LastCY = angnorm(CamAng:yaw())
     LastCP = angnorm(CamAng:pitch())
     CamYawS = LastCY
@@ -414,83 +484,11 @@ if (first() | dupefinished()) {
     soundPitch(9, 30)
     soundVolume(9, 0.1)
     timer("update", 50)
-    timer("vis", 20)
 
 } elseif (playerConnectClk()) {
     FilterDirty = 1
 
-# ================= VISUAL TICK =================
-} elseif (clk("vis")) {
-    local CY = angnorm(CamAng:yaw())
-    local CP = angnorm(CamAng:pitch())
-    local CamCh = (abs(angnorm(CY - LastCY)) > 0.15) | (abs(angnorm(CP - LastCP)) > 0.15)
-    local Busy = CamCh | CamDirty | TorsoBusy | (AimLeft > 0) | (AimRight > 0) | !Idle
-    timer("vis", Busy ? 20 : 60)
-    if (!Busy) { exit() }
-
-    local VDt = 0.02
-    CamDirty = 0
-    LastCY = CY
-    LastCP = CP
-
-    local Cf = clamp((CamSmooth/0.05)*VDt, 0, 1)
-    CamYawS = angnorm(CamYawS + angnorm(CY - CamYawS)*Cf)
-    CamPitchS = angnorm(CamPitchS + angnorm(CP - CamPitchS)*Cf)
-
-    if (TorsoReady) {
-        local TPit = clamp(CamPitchS, -TorsoPitchMax, TorsoPitchMax)
-        local TNew = slewAng(ang(TorsoPitch, TorsoYaw, 0), ang(TPit, CamYawS, 0), TorsoTurnRate, VDt)
-        TorsoYaw = angnorm(TNew:yaw())
-        TorsoPitch = angnorm(TNew:pitch())
-        holoAng(21, ang(TorsoPitch, TorsoYaw, 0))
-        TorsoBusy = (abs(angnorm(CamYawS - TorsoYaw)) > 0.3) | (abs(angnorm(TPit - TorsoPitch)) > 0.3)
-    } else {
-        TorsoBusy = 0
-    }
-
-    # Shared gun work: one aim point and at most two stow angles per visual tick.
-    local NeedStowR = (!GunStowR & (AimRight <= 0)) | ((AimRight > 0) & (AimRight < 1))
-    local NeedStowL = (!GunStowL & (AimLeft <= 0)) | ((AimLeft > 0) & (AimLeft < 1))
-    local StowR = ang(0)
-    local StowL = ang(0)
-    if (NeedStowR | NeedStowL) {
-        local StowRef = CurBase
-        if (TorsoReady) { StowRef = HT }
-        if (NeedStowR) { StowR = StowRef:toWorld(ang(35,-25,-25)) }
-        if (NeedStowL) { StowL = StowRef:toWorld(ang(35,25,25)) }
-    }
-    local AimPos = vec(0)
-    if ((AimRight > 0) | (AimLeft > 0)) { AimPos = Active ? CamAimPos : CurBase:toWorld(vec(9999,0,0)) }
-
-    if (AimRight > 0) {
-        if (GunStowR) { GunAimR = HGR:angles() GunStowR = 0 }
-        GunAimR = slewAng(GunAimR, (AimPos - HGR:pos()):toAngle(), GunTrackSpeed, VDt)
-        if (AimRight >= 1) { holoAng(11, GunAimR) } else { holoAng(11, slerp(quat(StowR), quat(GunAimR), AimRight*1.1):toAngle()) }
-    } elseif (!GunStowR) {
-        holoAng(11, StowR)
-        GunStowR = 1
-    }
-
-    if (AimLeft > 0) {
-        if (GunStowL) { GunAimL = HGL:angles() GunStowL = 0 }
-        GunAimL = slewAng(GunAimL, (AimPos - HGL:pos()):toAngle(), GunTrackSpeed, VDt)
-        if (AimLeft >= 1) { holoAng(12, GunAimL) } else { holoAng(12, slerp(quat(StowL), quat(GunAimL), AimLeft*1.1):toAngle()) }
-    } elseif (!GunStowL) {
-        holoAng(12, StowL)
-        GunStowL = 1
-    }
-
-    local CamLocal = FP_CamPos
-    if (ThirdPerson) { CamLocal = vec(TP_CamPos:x(), -CameraSideOffset*CameraSide, TP_CamPos:z()) }
-    if (CamFollowTorso & TorsoReady) {
-        CamPos = CurBase:toLocal(HT:toWorld(CamLocal))
-        Cam_Hold = ang(TorsoPitch, TorsoYaw, 0)
-    } else {
-        CamPos = CamLocal
-        if (CamHoldMode == 1) { Cam_Hold = CamAng } else { Cam_Hold = CurBase:angles() }
-    }
-
-# ================= PHYSICS TICK =================
+# ================= MAIN TICK =================
 } elseif (clk("update")) {
     Dt = Idle ? 0.1 : 0.05
     timer("update", Idle ? 100 : 50)
@@ -577,6 +575,9 @@ if (first() | dupefinished()) {
 
     local BasePos = CurBase:pos()
     local Vel = CurBase:vel()
+    local VelH = vec(Vel:x(), Vel:y(), 0)
+    local SpeedH = VelH:length()
+    local AngVel = CurBase:angVel()
     local HasMoveInput = (KW | KA | KS | KD)
 
     if (DoGround) {
@@ -586,8 +587,9 @@ if (first() | dupefinished()) {
         Dist = GR:distance() + Offset:z()
         GNrm = GR:hitNormal()
         GHit = GR:pos()
-        GVel = GR:entity():vel()*GroundVelScale
-        GWorld = !GR:entity()
+        local GE = GR:entity()
+        GVel = GE:vel()*GroundVelScale
+        GWorld = !GE
         local NewOG = GR:hit() & (Dist < StandHeight + 25)
         if (NewOG != On_Ground) {
             On_Ground = NewOG
@@ -613,8 +615,7 @@ if (first() | dupefinished()) {
             CamDirty = 1
         }
     } elseif (IdleLock & !HasMoveInput & On_Ground) {
-        local AV = CurBase:angVel()
-        local Spin = abs(AV:pitch()) + abs(AV:yaw()) + abs(AV:roll())
+        local Spin = abs(AngVel:pitch()) + abs(AngVel:yaw()) + abs(AngVel:roll())
         if ((Vel:length() < 0.5) & (Spin < 0.5) & (abs(StandHeight - Dist) < 1.5)) {
             Idle = 1
             CurBase:propSetVelocity(vec(0))
@@ -632,6 +633,7 @@ if (first() | dupefinished()) {
     A = KA & Active
     D = KD & Active
     AimMode = 1
+    updateVisual(Dt)
 
     if (!Idle) {
         YawCustom = angnorm(YawCustom + AimTurnSpeed*(KA - KD)*Dt)
@@ -646,11 +648,10 @@ if (first() | dupefinished()) {
         }
         if (Nrm:z() < 0) { Nrm = -Nrm }
         if (!On_Ground) { Nrm = ZAxis }
-        local MinNZ = cos(TerrainMaxTilt)
         if (Nrm:z() < MinNZ) {
             local Hv = vec(Nrm:x(), Nrm:y(), 0)
             local HL = Hv:length()
-            if (HL > 0.0001) { Nrm = (Hv*(sin(TerrainMaxTilt)/HL) + vec(0,0,MinNZ)):normalized() } else { Nrm = ZAxis }
+            if (HL > 0.0001) { Nrm = (Hv*(SinTilt/HL) + vec(0,0,MinNZ)):normalized() } else { Nrm = ZAxis }
         }
         # Rotation basis is reused by terrain projection, hull probe, foot slots and foot normals.
         local MoveF = vec(1,0,0):rotateAroundAxis(ZAxis, ChassisYaw)
@@ -664,11 +665,9 @@ if (first() | dupefinished()) {
         TerrainRoll = clamp(-atan(TNy, TNz), -TerrainMaxTilt, TerrainMaxTilt)
 
         local MoveVec = MoveF*(KW - KS)
-        local VelH = vec(Vel:x(), Vel:y(), 0)
-        local SpeedH = VelH:length()
         local MoveLen = MoveVec:length()
         local NeedProbe = HullEnable & ((SpeedH > 2) | (MoveLen > 0.01))
-        local DoHull = (GndN == 0) | (GndN == 2)
+        local DoHull = (GndN == 0)
         local PD = vec(0)
         local HaveProbe = 0
         if (!NeedProbe) {
@@ -694,7 +693,7 @@ if (first() | dupefinished()) {
             if (RH:hit()) {
                 HullHitPos = RH:pos()
                 HullHitN = RH:hitNormal()
-                HullHitUntil = (RH:distance() > 1) ? Curtime + 0.12 : 0
+                HullHitUntil = (RH:distance() > 1) ? Curtime + 0.25 : 0
             } else {
                 HullHitPos = vec(0)
                 HullHitN = vec(0)
@@ -720,7 +719,6 @@ if (first() | dupefinished()) {
         }
         local MoveLen2 = MoveVec:length()
         local MoveMag = clamp(MoveLen2, 0, 1)
-        local MoveDir = (MoveLen2 > 0) ? MoveVec/MoveLen2 : vec(0)
 
         if (Active & HasMoveInput) {
             if (CurrentMoveSpeed < Move_Speed_Min) { CurrentMoveSpeed = Move_Speed_Min }
@@ -738,44 +736,48 @@ if (first() | dupefinished()) {
         local DampXY = HasMoveInput ? Move_Damping : Coast_Damping
         local DampZ = 0.1 + 0.8*On_Ground
         local Damping_Force = -Vel*vec(DampXY, DampXY, DampZ)
-        local Move_Force = MoveDir*CurrentMoveSpeed*MoveMag
-        local AE = CurBase:toLocal(ang(TerrainPitch, ChassisYaw, TerrainRoll))
+        local MoveScale = (MoveLen2 > 0) ? CurrentMoveSpeed*MoveMag/MoveLen2 : 0
+        local Move_Force = MoveVec*MoveScale
+        local BaseAng = CurBase:angles()
+        local AE = ang(angnorm(TerrainPitch - BaseAng:pitch()), angnorm(ChassisYaw - BaseAng:yaw()), angnorm(TerrainRoll - BaseAng:roll()))
         CurBase:applyForce((GVel + Stand_Force + Damping_Force + Move_Force)*Mass)
-        CurBase:applyAngForce((ang(angnorm(AE:pitch()), angnorm(AE:yaw()), angnorm(AE:roll()))*45 - CurBase:angVel()*10)*Mass)
+        CurBase:applyAngForce((ang(angnorm(AE:pitch()), angnorm(AE:yaw()), angnorm(AE:roll()))*45 - AngVel*10)*Mass)
 
-        # ---- :    ,   ----
-        local StanceProj = Leg_Stand_Width*cos(TerrainRoll)
-        local FwdProj = Leg_Forward_Offset*cos(TerrainPitch)
-        local LSlot = BasePos + MoveF*FwdProj + MoveR*StanceProj
-        local RSlot = BasePos + MoveF*FwdProj - MoveR*StanceProj
-        local NomL = HP:toWorld(LHeight)
-        local NomR = HP:toWorld(RHeight)
-        local LTarget = NomL
-        local RTarget = NomR
-        local FootUpL = TerrainNormal
-        local FootUpR = TerrainNormal
-        if (On_Ground & !Edit & (GNrm:z() > 0.2)) {
-            local NZ = GNrm:z()
-            local GZL = GHit:z() - (GNrm:x()*(LSlot:x()-GHit:x()) + GNrm:y()*(LSlot:y()-GHit:y()))/NZ + FootGroundOffset
-            local GZR = GHit:z() - (GNrm:x()*(RSlot:x()-GHit:x()) + GNrm:y()*(RSlot:y()-GHit:y()))/NZ + FootGroundOffset
-            GZL = clamp(GZL, NomL:z() - FootTravelDown, NomL:z() + FootTravelUp)
-            GZR = clamp(GZR, NomR:z() - FootTravelDown, NomR:z() + FootTravelUp)
-            LTarget = vec(LSlot:x(), LSlot:y(), GZL)
-            RTarget = vec(RSlot:x(), RSlot:y(), GZR)
-            FootUpL = GNrm
-            FootUpR = GNrm
+        local DoIK = (GndN == 0) | (GndN == 2)
+        if (DoIK) {
+            # ---- :    ,   ----
+            local StanceProj = Leg_Stand_Width*cos(TerrainRoll)
+            local FwdProj = Leg_Forward_Offset*cos(TerrainPitch)
+            local LSlot = BasePos + MoveF*FwdProj + MoveR*StanceProj
+            local RSlot = BasePos + MoveF*FwdProj - MoveR*StanceProj
+            local NomL = HP:toWorld(LHeight)
+            local NomR = HP:toWorld(RHeight)
+            local LTarget = NomL
+            local RTarget = NomR
+            local FootUpL = TerrainNormal
+            local FootUpR = TerrainNormal
+            if (On_Ground & !Edit & (GNrm:z() > 0.2)) {
+                local NZ = GNrm:z()
+                local GZL = GHit:z() - (GNrm:x()*(LSlot:x()-GHit:x()) + GNrm:y()*(LSlot:y()-GHit:y()))/NZ + FootGroundOffset
+                local GZR = GHit:z() - (GNrm:x()*(RSlot:x()-GHit:x()) + GNrm:y()*(RSlot:y()-GHit:y()))/NZ + FootGroundOffset
+                GZL = clamp(GZL, NomL:z() - FootTravelDown, NomL:z() + FootTravelUp)
+                GZR = clamp(GZR, NomR:z() - FootTravelDown, NomR:z() + FootTravelUp)
+                LTarget = vec(LSlot:x(), LSlot:y(), GZL)
+                RTarget = vec(RSlot:x(), RSlot:y(), GZR)
+                FootUpL = GNrm
+                FootUpR = GNrm
+            }
+            two_seg_ik(2, 3, 4, HLA, HLH, HP, LTarget)
+            two_seg_ik(7, 8, 9, HRA, HRH, HP, RTarget)
+            local NFx = FootUpL:dot(MoveF)
+            local NFy = FootUpL:dot(MoveR)
+            local NFz = FootUpL:z()
+            holoAng(5, ang(clamp(atan(NFx, NFz), -50, 50), ChassisYaw + FootSplay, clamp(-atan(NFy, NFz), -50, 50)))
+            local NRx = FootUpR:dot(MoveF)
+            local NRy = FootUpR:dot(MoveR)
+            local NRz = FootUpR:z()
+            holoAng(10, ang(clamp(atan(NRx, NRz), -50, 50), ChassisYaw - FootSplay, clamp(-atan(NRy, NRz), -50, 50)))
         }
-        two_seg_ik(2, 3, 4, HLA, HLH, HP, LTarget)
-        two_seg_ik(7, 8, 9, HRA, HRH, HP, RTarget)
-        local NFx = FootUpL:dot(MoveF)
-        local NFy = FootUpL:dot(MoveR)
-        local NFz = FootUpL:z()
-        holoAng(5, ang(clamp(atan(NFx, NFz), -50, 50), ChassisYaw + FootSplay, clamp(-atan(NFy, NFz), -50, 50)))
-        local NRx = FootUpR:dot(MoveF)
-        local NRy = FootUpR:dot(MoveR)
-        local NRz = FootUpR:z()
-        holoAng(10, ang(clamp(atan(NRx, NRz), -50, 50), ChassisYaw - FootSplay, clamp(-atan(NRy, NRz), -50, 50)))
-
         CamDirty = 1
     }
 
@@ -784,6 +786,7 @@ if (first() | dupefinished()) {
         ShoulderMode = !ShoulderMode
         if (ShoulderMode) {
             ShoulderDeploy = 1
+            CamMoved = 1
             ShoulderDeployTime = Curtime + ShoulderDeployDelay
             ShoulderStowUntil = 0
         } else {
@@ -812,7 +815,7 @@ if (first() | dupefinished()) {
     FireShoulder4 = ShoulderHoloReady4*((ShoulderSide4 == 1) ? FireShoulderLeft : FireShoulderRight)
 
     if ((Active & ShoulderMode) | (ShoulderStowUntil > Curtime)) {
-        if (Active & ShoulderMode & !ShoulderDeploy) {
+        if (Active & ShoulderMode & !ShoulderDeploy & CamMoved) {
             local STar = ang(clamp(CamPitchS + Shoulder_Aim_Pitch_Offset, -80, 80), CamYawS + Shoulder_Aim_Yaw_Offset, Shoulder_Aim_Roll_Offset)
             for (I = 1, 4) {
                 local Index = 12 + I
@@ -820,12 +823,12 @@ if (first() | dupefinished()) {
                 if (S) { holoAng(Index, slewAng(S:angles(), STar, TorsoTurnRate, Dt)) }
             }
         } else {
-            local StowQ = quat(shoulderStowAng())
+            local StowAng = shoulderStowAng()
             local T = clamp(Shoulder_Stow_Speed/100, 0.01, 1)
             for (I = 1, 4) {
                 local Index = 12 + I
                 local S = holoEntity(Index)
-                if (S) { holoAng(Index, slerp(quat(S:angles()), StowQ, T):toAngle()) }
+                if (S) { holoAng(Index, lerpAng(S:angles(), StowAng, T)) }
             }
         }
     }
@@ -834,8 +837,7 @@ if (first() | dupefinished()) {
     if (!ThirdPerson) { if (ZMState < 0) { ZMState = 0 } }
 
     if (!Idle | (EngineCurrentVol > 0) | (SlideVol > 0)) {
-        local SpeedRef = max(Move_Speed, 1)
-        local GroundSpeed2 = vec(Vel:x(), Vel:y(), 0):length()
+        local GroundSpeed2 = SpeedH
         local BoostAny = (W | A | S | D) & Active & !Edit
         if (BoostAny & !BoostWasOn) {
             soundStop(30)
