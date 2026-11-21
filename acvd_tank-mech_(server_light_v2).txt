@@ -21,15 +21,15 @@
 @persist TerrainLerp TerrainAirLerp TerrainMaxTilt TerrainPitch TerrainRoll FootTravelDown FootTravelUp TerrainWorldOnly GroundWorldOnly
 @persist HullEnable HullLen HullWid HullH HullLift HullFwd HullLook HullBrake
 @persist CurBase:entity RebasePhase PendingBase:entity RigFilter:array
-@persist Idle IdleLock CamDirty CamMoved SlowN GndN FilterDirty HullHitUntil EngineVolLast SlideVolLast SlidePitchLast SpeedRef MinNZ SinTilt
+@persist Idle IdleLock CamDirty CamMoved SlowN GndN FilterDirty HullHitUntil EngineVolLast SlideVolLast SlidePitchLast SpeedRef MinNZ SinTilt StandDist
 @persist [HP HLA HLH HLT HLF HRA HRH HRT HRF HGR HGL HT]:entity
 @trigger none
 
 # ================= OPTIMIZATION NOTES =================
 # - Single 20 Hz timer: the old 50 Hz visual timer was merged into the physics tick.
 # - Ranger filter keeps only roots, direct children, holos and players (no recursive
-#   tree or connected-entity scan); hull probe runs at 5 Hz with a cached normal.
-# - Leg IK runs at 10 Hz; holoAng values persist between ticks.
+#   tree or connected-entity scan); hull probe runs at 10 Hz with a cached normal.
+# - Leg IK runs every physics tick; stand height is smoothed to avoid vertical jitter.
 # - Quaternion slerp replaced by an angle-space lerp; shoulder slew only on camera move.
 # - Yaw basis, speed, angular velocity, tilt trig and ranger entity are reused.
 # - Control flow uses the canonical `} elseif` / `} else` form from the Wiremod wiki.
@@ -277,6 +277,7 @@ if (first() | dupefinished()) {
     RangerDist = (Height+4)*1.5
     StandHeight = (Height+4)*1.1
     Dist = StandHeight
+    StandDist = StandHeight
     Length_A2 = Length_A*Length_A
     Length_B2 = Length_B*Length_B
     Length_AB = Length_A + Length_B
@@ -585,12 +586,14 @@ if (first() | dupefinished()) {
         local GR = rangerOffsetHull(RangerDist, BasePos, -ZAxis, RangerHull)
         if (GroundWorldOnly) { rangerHitEntities(1) }
         Dist = GR:distance() + Offset:z()
+        StandDist = StandDist + (Dist - StandDist)*0.35
         GNrm = GR:hitNormal()
         GHit = GR:pos()
         local GE = GR:entity()
         GVel = GE:vel()*GroundVelScale
         GWorld = !GE
-        local NewOG = GR:hit() & (Dist < StandHeight + 25)
+        local GroundBand = On_Ground ? (StandHeight + 35) : (StandHeight + 25)
+        local NewOG = GR:hit() & (Dist < GroundBand)
         if (NewOG != On_Ground) {
             On_Ground = NewOG
             CurBase:propGravity(!On_Ground)
@@ -608,7 +611,7 @@ if (first() | dupefinished()) {
     if (!On_Ground) { if (BasePos:z() > MaxFallZ) { MaxFallZ = BasePos:z() } }
 
     if (Idle) {
-        if (HasMoveInput | !On_Ground | (abs(StandHeight - Dist) > 4)) {
+        if (HasMoveInput | !On_Ground | (abs(StandHeight - StandDist) > 4)) {
             Idle = 0
             CurBase:propFreeze(0)
             CurBase:propGravity(!On_Ground)
@@ -616,7 +619,7 @@ if (first() | dupefinished()) {
         }
     } elseif (IdleLock & !HasMoveInput & On_Ground) {
         local Spin = abs(AngVel:pitch()) + abs(AngVel:yaw()) + abs(AngVel:roll())
-        if ((Vel:length() < 0.5) & (Spin < 0.5) & (abs(StandHeight - Dist) < 1.5)) {
+        if ((Vel:length() < 0.5) & (Spin < 0.5) & (abs(StandHeight - StandDist) < 1.5)) {
             Idle = 1
             CurBase:propSetVelocity(vec(0))
             CurBase:propFreeze(1)
@@ -667,7 +670,7 @@ if (first() | dupefinished()) {
         local MoveVec = MoveF*(KW - KS)
         local MoveLen = MoveVec:length()
         local NeedProbe = HullEnable & ((SpeedH > 2) | (MoveLen > 0.01))
-        local DoHull = (GndN == 0)
+        local DoHull = (GndN == 0) | (GndN == 2)
         local PD = vec(0)
         local HaveProbe = 0
         if (!NeedProbe) {
@@ -693,7 +696,7 @@ if (first() | dupefinished()) {
             if (RH:hit()) {
                 HullHitPos = RH:pos()
                 HullHitN = RH:hitNormal()
-                HullHitUntil = (RH:distance() > 1) ? Curtime + 0.25 : 0
+                HullHitUntil = (RH:distance() > 1) ? Curtime + 0.12 : 0
             } else {
                 HullHitPos = vec(0)
                 HullHitN = vec(0)
@@ -730,7 +733,7 @@ if (first() | dupefinished()) {
         holoAng(1, ang(TerrainPitch, ChassisYaw, TerrainRoll))
         # Torso angle is already set by the visual tick, no need to duplicate it here.
 
-        local HErr = StandHeight - Dist
+        local HErr = StandHeight - StandDist
         if (abs(HErr) < 1) { HErr = 0 }
         local Stand_Force = vec(0,0,HErr*5)*On_Ground
         local DampXY = HasMoveInput ? Move_Damping : Coast_Damping
@@ -738,46 +741,42 @@ if (first() | dupefinished()) {
         local Damping_Force = -Vel*vec(DampXY, DampXY, DampZ)
         local MoveScale = (MoveLen2 > 0) ? CurrentMoveSpeed*MoveMag/MoveLen2 : 0
         local Move_Force = MoveVec*MoveScale
-        local BaseAng = CurBase:angles()
-        local AE = ang(angnorm(TerrainPitch - BaseAng:pitch()), angnorm(ChassisYaw - BaseAng:yaw()), angnorm(TerrainRoll - BaseAng:roll()))
+        local AE = CurBase:toLocal(ang(TerrainPitch, ChassisYaw, TerrainRoll))
         CurBase:applyForce((GVel + Stand_Force + Damping_Force + Move_Force)*Mass)
         CurBase:applyAngForce((ang(angnorm(AE:pitch()), angnorm(AE:yaw()), angnorm(AE:roll()))*45 - AngVel*10)*Mass)
 
-        local DoIK = (GndN == 0) | (GndN == 2)
-        if (DoIK) {
-            # ---- :    ,   ----
-            local StanceProj = Leg_Stand_Width*cos(TerrainRoll)
-            local FwdProj = Leg_Forward_Offset*cos(TerrainPitch)
-            local LSlot = BasePos + MoveF*FwdProj + MoveR*StanceProj
-            local RSlot = BasePos + MoveF*FwdProj - MoveR*StanceProj
-            local NomL = HP:toWorld(LHeight)
-            local NomR = HP:toWorld(RHeight)
-            local LTarget = NomL
-            local RTarget = NomR
-            local FootUpL = TerrainNormal
-            local FootUpR = TerrainNormal
-            if (On_Ground & !Edit & (GNrm:z() > 0.2)) {
-                local NZ = GNrm:z()
-                local GZL = GHit:z() - (GNrm:x()*(LSlot:x()-GHit:x()) + GNrm:y()*(LSlot:y()-GHit:y()))/NZ + FootGroundOffset
-                local GZR = GHit:z() - (GNrm:x()*(RSlot:x()-GHit:x()) + GNrm:y()*(RSlot:y()-GHit:y()))/NZ + FootGroundOffset
-                GZL = clamp(GZL, NomL:z() - FootTravelDown, NomL:z() + FootTravelUp)
-                GZR = clamp(GZR, NomR:z() - FootTravelDown, NomR:z() + FootTravelUp)
-                LTarget = vec(LSlot:x(), LSlot:y(), GZL)
-                RTarget = vec(RSlot:x(), RSlot:y(), GZR)
-                FootUpL = GNrm
-                FootUpR = GNrm
-            }
-            two_seg_ik(2, 3, 4, HLA, HLH, HP, LTarget)
-            two_seg_ik(7, 8, 9, HRA, HRH, HP, RTarget)
-            local NFx = FootUpL:dot(MoveF)
-            local NFy = FootUpL:dot(MoveR)
-            local NFz = FootUpL:z()
-            holoAng(5, ang(clamp(atan(NFx, NFz), -50, 50), ChassisYaw + FootSplay, clamp(-atan(NFy, NFz), -50, 50)))
-            local NRx = FootUpR:dot(MoveF)
-            local NRy = FootUpR:dot(MoveR)
-            local NRz = FootUpR:z()
-            holoAng(10, ang(clamp(atan(NRx, NRz), -50, 50), ChassisYaw - FootSplay, clamp(-atan(NRy, NRz), -50, 50)))
+        # ---- :    ,   ----
+        local StanceProj = Leg_Stand_Width*cos(TerrainRoll)
+        local FwdProj = Leg_Forward_Offset*cos(TerrainPitch)
+        local LSlot = BasePos + MoveF*FwdProj + MoveR*StanceProj
+        local RSlot = BasePos + MoveF*FwdProj - MoveR*StanceProj
+        local NomL = HP:toWorld(LHeight)
+        local NomR = HP:toWorld(RHeight)
+        local LTarget = NomL
+        local RTarget = NomR
+        local FootUpL = TerrainNormal
+        local FootUpR = TerrainNormal
+        if (On_Ground & !Edit & (GNrm:z() > 0.2)) {
+            local NZ = GNrm:z()
+            local GZL = GHit:z() - (GNrm:x()*(LSlot:x()-GHit:x()) + GNrm:y()*(LSlot:y()-GHit:y()))/NZ + FootGroundOffset
+            local GZR = GHit:z() - (GNrm:x()*(RSlot:x()-GHit:x()) + GNrm:y()*(RSlot:y()-GHit:y()))/NZ + FootGroundOffset
+            GZL = clamp(GZL, NomL:z() - FootTravelDown, NomL:z() + FootTravelUp)
+            GZR = clamp(GZR, NomR:z() - FootTravelDown, NomR:z() + FootTravelUp)
+            LTarget = vec(LSlot:x(), LSlot:y(), GZL)
+            RTarget = vec(RSlot:x(), RSlot:y(), GZR)
+            FootUpL = GNrm
+            FootUpR = GNrm
         }
+        two_seg_ik(2, 3, 4, HLA, HLH, HP, LTarget)
+        two_seg_ik(7, 8, 9, HRA, HRH, HP, RTarget)
+        local NFx = FootUpL:dot(MoveF)
+        local NFy = FootUpL:dot(MoveR)
+        local NFz = FootUpL:z()
+        holoAng(5, ang(clamp(atan(NFx, NFz), -50, 50), ChassisYaw + FootSplay, clamp(-atan(NFy, NFz), -50, 50)))
+        local NRx = FootUpR:dot(MoveF)
+        local NRy = FootUpR:dot(MoveR)
+        local NRz = FootUpR:z()
+        holoAng(10, ang(clamp(atan(NRx, NRz), -50, 50), ChassisYaw - FootSplay, clamp(-atan(NRy, NRz), -50, 50)))
         CamDirty = 1
     }
 
