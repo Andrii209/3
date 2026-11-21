@@ -21,9 +21,17 @@
 @persist TerrainLerp TerrainAirLerp TerrainMaxTilt TerrainPitch TerrainRoll FootTravelDown FootTravelUp TerrainWorldOnly GroundWorldOnly
 @persist HullEnable HullLen HullWid HullH HullLift HullFwd HullLook HullBrake
 @persist CurBase:entity RebasePhase PendingBase:entity RigFilter:array
-@persist Idle IdleLock CamDirty SlowN GndN
+@persist Idle IdleLock CamDirty SlowN GndN FilterDirty HullHitUntil EngineVolLast SlideVolLast SlidePitchLast
 @persist [HP HLA HLH HLT HLF HRA HRH HRT HRF HGR HGL HT]:entity
 @trigger none
+
+# ================= OPTIMIZATION NOTES =================
+# - Ranger filter is rebuilt at most once per slow tick (was up to 5x).
+# - Hull probe runs at 10 Hz with a cached wall normal; collision response stays 20 Hz.
+# - Yaw rotations are reused as basis vectors instead of recomputed per target.
+# - Aim point / stow angles / shoulder stow quaternion computed once per tick.
+# - Redundant holoAng, toLocal and sound API calls removed.
+# Tuning values and visible behaviour are unchanged.
 
 # ================= FUNCTIONS =================
 function angle slewAng(Cur:angle, Tar:angle, Rate, DD) {
@@ -89,16 +97,16 @@ function number setupShoulder(Index, ShoulderBase:entity) {
     holoEntity(Index):propFreeze(1)
     ShoulderBase:propFreeze(1)
     for (I = 1, ShoulderChildren:count()) { ShoulderChildren[I, entity]:parentTo(ShoulderBase) }
-    buildRangerFilter()
+    FilterDirty = 1
     return 1
 }
 function stowShoulders() {
     if (CurBase) {
         local StowAng = shoulderStowAng()
-        if (ShoulderHoloReady1) { holoAng(13, StowAng) }
-        if (ShoulderHoloReady2) { holoAng(14, StowAng) }
-        if (ShoulderHoloReady3) { holoAng(15, StowAng) }
-        if (ShoulderHoloReady4) { holoAng(16, StowAng) }
+        for (I = 1, 4) {
+            local Index = 12 + I
+            if (holoEntity(Index)) { holoAng(Index, StowAng) }
+        }
     }
 }
 function two_seg_ik(IA, IB, IK, A:entity, B:entity, P:entity, Target:vector) {
@@ -205,6 +213,9 @@ if (first() | dupefinished()) {
     Length_BA2 = 2*Length_A*Length_B
 
     MaxFallZ = 0
+    HullHitUntil = 0
+    HullHitPos = vec(0)
+    HullHitN = vec(0)
     LandingFXCooldown = 0.8
     LastLandTime = -999
     FallFXHeight = 220
@@ -234,8 +245,11 @@ if (first() | dupefinished()) {
     CameraSideOffset = 30
     EngineVolume = 0.45
     EngineCurrentVol = 0
+    EngineVolLast = -1
     SlideReady = 0
     SlideVol = 0
+    SlideVolLast = -1
+    SlidePitchLast = -1
     SlideTargetVol = 0
     SlideVolMax = 0.35
     SlidePitchMin = 70
@@ -394,6 +408,7 @@ if (first() | dupefinished()) {
     HT = holoEntity(21)
 
     buildRangerFilter()
+    FilterDirty = 0
     CurBase:soundPlay(9, 0, "ambient/machines/spin_loop.wav")
     soundPitch(9, 30)
     soundVolume(9, 0.1)
@@ -401,7 +416,7 @@ if (first() | dupefinished()) {
     timer("vis", 20)
 
 } elseif (playerConnectClk()) {
-    buildRangerFilter()
+    FilterDirty = 1
 
 # ================= VISUAL TICK =================
 } elseif (clk("vis")) {
@@ -432,38 +447,36 @@ if (first() | dupefinished()) {
         TorsoBusy = 0
     }
 
+    # Shared gun work: one aim point and at most two stow angles per visual tick.
+    local NeedStowR = (!GunStowR & (AimRight <= 0)) | ((AimRight > 0) & (AimRight < 1))
+    local NeedStowL = (!GunStowL & (AimLeft <= 0)) | ((AimLeft > 0) & (AimLeft < 1))
+    local StowR = ang(0)
+    local StowL = ang(0)
+    if (NeedStowR | NeedStowL) {
+        local StowRef = CurBase
+        if (TorsoReady) { StowRef = HT }
+        if (NeedStowR) { StowR = StowRef:toWorld(ang(35,-25,-25)) }
+        if (NeedStowL) { StowL = StowRef:toWorld(ang(35,25,25)) }
+    }
+    local AimPos = vec(0)
+    if ((AimRight > 0) | (AimLeft > 0)) { AimPos = Active ? CamAimPos : CurBase:toWorld(vec(9999,0,0)) }
+
     if (AimRight > 0) {
         if (GunStowR) { GunAimR = HGR:angles() GunStowR = 0 }
-        local AimPos = Active ? CamAimPos : CurBase:toWorld(vec(9999,0,0))
         GunAimR = slewAng(GunAimR, (AimPos - HGR:pos()):toAngle(), GunTrackSpeed, VDt)
-        if (AimRight >= 1) {
-            holoAng(11, GunAimR)
-        } else {
-            local StowR = CurBase:toWorld(ang(35,-25,-25))
-            if (TorsoReady) { StowR = HT:toWorld(ang(35,-25,-25)) }
-            holoAng(11, slerp(quat(StowR), quat(GunAimR), AimRight*1.1):toAngle())
-        }
+        if (AimRight >= 1) { holoAng(11, GunAimR) }
+        else { holoAng(11, slerp(quat(StowR), quat(GunAimR), AimRight*1.1):toAngle()) }
     } elseif (!GunStowR) {
-        local StowR = CurBase:toWorld(ang(35,-25,-25))
-        if (TorsoReady) { StowR = HT:toWorld(ang(35,-25,-25)) }
         holoAng(11, StowR)
         GunStowR = 1
     }
 
     if (AimLeft > 0) {
         if (GunStowL) { GunAimL = HGL:angles() GunStowL = 0 }
-        local AimPos = Active ? CamAimPos : CurBase:toWorld(vec(9999,0,0))
         GunAimL = slewAng(GunAimL, (AimPos - HGL:pos()):toAngle(), GunTrackSpeed, VDt)
-        if (AimLeft >= 1) {
-            holoAng(12, GunAimL)
-        } else {
-            local StowL = CurBase:toWorld(ang(35,25,25))
-            if (TorsoReady) { StowL = HT:toWorld(ang(35,25,25)) }
-            holoAng(12, slerp(quat(StowL), quat(GunAimL), AimLeft*1.1):toAngle())
-        }
+        if (AimLeft >= 1) { holoAng(12, GunAimL) }
+        else { holoAng(12, slerp(quat(StowL), quat(GunAimL), AimLeft*1.1):toAngle()) }
     } elseif (!GunStowL) {
-        local StowL = CurBase:toWorld(ang(35,25,25))
-        if (TorsoReady) { StowL = HT:toWorld(ang(35,25,25)) }
         holoAng(12, StowL)
         GunStowL = 1
     }
@@ -520,7 +533,7 @@ if (first() | dupefinished()) {
         CamFilter:pushEntity(Gun_Left_Ent)
         foreach (I, E:entity = CurBase:getConstraints()) { CamFilter:pushEntity(E) }
         foreach (I, E:entity = CurBase:children()) { CamFilter:pushEntity(E) }
-        buildRangerFilter()
+        FilterDirty = 1
         MaxFallZ = CurBase:pos():z()
         ChassisYaw = CurBase:angles():yaw()
         YawCustom = ChassisYaw
@@ -546,12 +559,13 @@ if (first() | dupefinished()) {
 
     if (DoSlow) {
         PartsOK = CurBase & Pelvis & Seat & RHip & LHip & LFoot & RFoot & LThigh & RThigh
-        if (changed(Ignore1) | changed(Ignore2) | changed(Ignore3) | changed(Ignore4)) { buildRangerFilter() }
+        if (changed(Ignore1) | changed(Ignore2) | changed(Ignore3) | changed(Ignore4)) { FilterDirty = 1 }
         if (!ShoulderHoloReady1 & Shoulder_Base_1 & CurBase) { ShoulderHoloReady1 = setupShoulder(13, Shoulder_Base_1) }
         if (!ShoulderHoloReady2 & Shoulder_Base_2 & CurBase) { ShoulderHoloReady2 = setupShoulder(14, Shoulder_Base_2) }
         if (!ShoulderHoloReady3 & Shoulder_Base_3 & CurBase) { ShoulderHoloReady3 = setupShoulder(15, Shoulder_Base_3) }
         if (!ShoulderHoloReady4 & Shoulder_Base_4 & CurBase) { ShoulderHoloReady4 = setupShoulder(16, Shoulder_Base_4) }
     }
+    if (FilterDirty) { buildRangerFilter() FilterDirty = 0 }
 
     if (changed(BKey) & BKey & Active) { CameraSide = -CameraSide CamDirty = 1 }
     if (changed(Alt) & Alt) { ThirdPerson = !ThirdPerson CamDirty = 1 CamDist = TP_Dist*ThirdPerson }
@@ -640,56 +654,75 @@ if (first() | dupefinished()) {
             if (HL > 0.0001) { Nrm = (Hv*(sin(TerrainMaxTilt)/HL) + vec(0,0,MinNZ)):normalized() }
             else { Nrm = ZAxis }
         }
+        # Rotation basis is reused by terrain projection, hull probe, foot slots and foot normals.
+        local MoveF = vec(1,0,0):rotateAroundAxis(ZAxis, ChassisYaw)
+        local MoveR = vec(0,1,0):rotateAroundAxis(ZAxis, ChassisYaw)
         local TLerp = On_Ground ? TerrainLerp : TerrainAirLerp
         TerrainNormal = (TerrainNormal + (Nrm - TerrainNormal)*TLerp):normalized()
-        local NYaw = TerrainNormal:rotateAroundAxis(ZAxis, -ChassisYaw)
-        TerrainPitch = clamp(atan(NYaw:x(), NYaw:z()), -TerrainMaxTilt, TerrainMaxTilt)
-        TerrainRoll = clamp(-atan(NYaw:y(), NYaw:z()), -TerrainMaxTilt, TerrainMaxTilt)
+        local TNx = TerrainNormal:dot(MoveF)
+        local TNy = TerrainNormal:dot(MoveR)
+        local TNz = TerrainNormal:z()
+        TerrainPitch = clamp(atan(TNx, TNz), -TerrainMaxTilt, TerrainMaxTilt)
+        TerrainRoll = clamp(-atan(TNy, TNz), -TerrainMaxTilt, TerrainMaxTilt)
 
-        LHeight = vec(Leg_Forward_Offset, Leg_Stand_Width, -Height)
-        RHeight = vec(Leg_Forward_Offset, -Leg_Stand_Width, -Height)
-
-        local MoveF = vec(1,0,0):rotateAroundAxis(ZAxis, ChassisYaw)
         local MoveVec = MoveF*(KW - KS)
         local VelH = vec(Vel:x(), Vel:y(), 0)
-        HullHitPos = vec(0)
-        HullHitN = vec(0)
-        if (HullEnable & ((VelH:length() > 2) | (MoveVec:length() > 0.01))) {
-            local Intent = vec(0)
-            if (MoveVec:length() > 0.01) { Intent = MoveVec:normalized() }
-            local ProbeDir = VelH + Intent*60
-            if (ProbeDir:length() > 1) {
-                local PD = ProbeDir:normalized()
-                local HullCenter = BasePos + vec(HullFwd,0,HullLift):rotateAroundAxis(ZAxis, ChassisYaw)
-                local Look = HullLook + VelH:length()*0.15
-                local HR = vec(0,-1,0):rotateAroundAxis(ZAxis, ChassisYaw)
-                local HX = abs(MoveF:x())*HullLen + abs(HR:x())*HullWid
-                local HY = abs(MoveF:y())*HullLen + abs(HR:y())*HullWid
-                rangerHitEntities(1)
-                local RH = rangerOffsetHull(Look, HullCenter, PD, vec(HX,HY,HullH))
-                if (RH:hit()) {
-                    HullHitPos = RH:pos()
-                    HullHitN = RH:hitNormal()
-                    if (RH:distance() > 1) {
-                        local N = RH:hitNormal()
-                        if (abs(N:z()) < 0.6) {
-                            local NH = vec(N:x(), N:y(), 0)
-                            if (NH:length() > 0.01) {
-                                local WN = NH:normalized()
-                                if (WN:dot(PD) < -0.2) {
-                                    local DriveInto = MoveVec:dot(WN)
-                                    if (DriveInto < 0) { MoveVec = MoveVec - WN*DriveInto }
-                                    local VelInto = VelH:dot(WN)
-                                    if (VelInto < 0) { CurBase:propSetVelocity(Vel - WN*VelInto*HullBrake) }
-                                }
-                            }
-                        }
+        local SpeedH = VelH:length()
+        local MoveLen = MoveVec:length()
+        local NeedProbe = HullEnable & ((SpeedH > 2) | (MoveLen > 0.01))
+        local DoHull = (GndN == 0) | (GndN == 2)
+        local PD = vec(0)
+        local HaveProbe = 0
+        if (!NeedProbe) {
+            HullHitPos = vec(0)
+            HullHitN = vec(0)
+            HullHitUntil = 0
+        } elseif (MoveLen > 0.01) {
+            local ProbeDir = VelH + (MoveVec/MoveLen)*60
+            local ProbeLen = ProbeDir:length()
+            if (ProbeLen > 1) { PD = ProbeDir/ProbeLen HaveProbe = 1 }
+        } elseif (SpeedH > 1) {
+            PD = VelH/SpeedH
+            HaveProbe = 1
+        }
+        if (DoHull & HaveProbe) {
+            local HR = -MoveR
+            local HX = abs(MoveF:x())*HullLen + abs(HR:x())*HullWid
+            local HY = abs(MoveF:y())*HullLen + abs(HR:y())*HullWid
+            local HullCenter = BasePos + MoveF*HullFwd + ZAxis*HullLift
+            local Look = HullLook + SpeedH*0.15
+            rangerHitEntities(1)
+            local RH = rangerOffsetHull(Look, HullCenter, PD, vec(HX,HY,HullH))
+            if (RH:hit()) {
+                HullHitPos = RH:pos()
+                HullHitN = RH:hitNormal()
+                HullHitUntil = (RH:distance() > 1) ? Curtime + 0.12 : 0
+            } else {
+                HullHitPos = vec(0)
+                HullHitN = vec(0)
+                HullHitUntil = 0
+            }
+        }
+        # Wall response is applied on every fast tick using the cached normal.
+        if (HaveProbe & (Curtime < HullHitUntil)) {
+            local N = HullHitN
+            if (abs(N:z()) < 0.6) {
+                local NH = vec(N:x(), N:y(), 0)
+                local NHL = NH:length()
+                if (NHL > 0.01) {
+                    local WN = NH/NHL
+                    if (WN:dot(PD) < -0.2) {
+                        local DriveInto = MoveVec:dot(WN)
+                        if (DriveInto < 0) { MoveVec = MoveVec - WN*DriveInto }
+                        local VelInto = VelH:dot(WN)
+                        if (VelInto < 0) { CurBase:propSetVelocity(Vel - WN*VelInto*HullBrake) }
                     }
                 }
             }
         }
-        local MoveMag = clamp(MoveVec:length(), 0, 1)
-        local MoveDir = MoveVec:normalized()
+        local MoveLen2 = MoveVec:length()
+        local MoveMag = clamp(MoveLen2, 0, 1)
+        local MoveDir = (MoveLen2 > 0) ? MoveVec/MoveLen2 : vec(0)
 
         if (Active & HasMoveInput) {
             if (CurrentMoveSpeed < Move_Speed_Min) { CurrentMoveSpeed = Move_Speed_Min }
@@ -699,7 +732,7 @@ if (first() | dupefinished()) {
         }
 
         holoAng(1, ang(TerrainPitch, ChassisYaw, TerrainRoll))
-        if (TorsoReady) { holoAng(21, ang(TorsoPitch, TorsoYaw, 0)) }
+        # Torso angle is already set by the visual tick, no need to duplicate it here.
 
         local HErr = StandHeight - Dist
         if (abs(HErr) < 1) { HErr = 0 }
@@ -715,8 +748,8 @@ if (first() | dupefinished()) {
         # ---- :    ,   ----
         local StanceProj = Leg_Stand_Width*cos(TerrainRoll)
         local FwdProj = Leg_Forward_Offset*cos(TerrainPitch)
-        local LSlot = BasePos + vec(FwdProj, StanceProj, 0):rotateAroundAxis(ZAxis, ChassisYaw)
-        local RSlot = BasePos + vec(FwdProj, -StanceProj, 0):rotateAroundAxis(ZAxis, ChassisYaw)
+        local LSlot = BasePos + MoveF*FwdProj + MoveR*StanceProj
+        local RSlot = BasePos + MoveF*FwdProj - MoveR*StanceProj
         local NomL = HP:toWorld(LHeight)
         local NomR = HP:toWorld(RHeight)
         local LTarget = NomL
@@ -736,10 +769,14 @@ if (first() | dupefinished()) {
         }
         two_seg_ik(2, 3, 4, HLA, HLH, HP, LTarget)
         two_seg_ik(7, 8, 9, HRA, HRH, HP, RTarget)
-        local NLF = FootUpL:rotateAroundAxis(ZAxis, -ChassisYaw)
-        local NRF = FootUpR:rotateAroundAxis(ZAxis, -ChassisYaw)
-        holoAng(5, ang(clamp(atan(NLF:x(), NLF:z()), -50, 50), ChassisYaw + FootSplay, clamp(-atan(NLF:y(), NLF:z()), -50, 50)))
-        holoAng(10, ang(clamp(atan(NRF:x(), NRF:z()), -50, 50), ChassisYaw - FootSplay, clamp(-atan(NRF:y(), NRF:z()), -50, 50)))
+        local NFx = FootUpL:dot(MoveF)
+        local NFy = FootUpL:dot(MoveR)
+        local NFz = FootUpL:z()
+        holoAng(5, ang(clamp(atan(NFx, NFz), -50, 50), ChassisYaw + FootSplay, clamp(-atan(NFy, NFz), -50, 50)))
+        local NRx = FootUpR:dot(MoveF)
+        local NRy = FootUpR:dot(MoveR)
+        local NRz = FootUpR:z()
+        holoAng(10, ang(clamp(atan(NRx, NRz), -50, 50), ChassisYaw - FootSplay, clamp(-atan(NRy, NRz), -50, 50)))
 
         CamDirty = 1
     }
@@ -779,17 +816,19 @@ if (first() | dupefinished()) {
     if ((Active & ShoulderMode) | (ShoulderStowUntil > Curtime)) {
         if (Active & ShoulderMode & !ShoulderDeploy) {
             local STar = ang(clamp(CamPitchS + Shoulder_Aim_Pitch_Offset, -80, 80), CamYawS + Shoulder_Aim_Yaw_Offset, Shoulder_Aim_Roll_Offset)
-            if (ShoulderHoloReady1) { holoAng(13, slewAng(holoEntity(13):angles(), STar, TorsoTurnRate, Dt)) }
-            if (ShoulderHoloReady2) { holoAng(14, slewAng(holoEntity(14):angles(), STar, TorsoTurnRate, Dt)) }
-            if (ShoulderHoloReady3) { holoAng(15, slewAng(holoEntity(15):angles(), STar, TorsoTurnRate, Dt)) }
-            if (ShoulderHoloReady4) { holoAng(16, slewAng(holoEntity(16):angles(), STar, TorsoTurnRate, Dt)) }
+            for (I = 1, 4) {
+                local Index = 12 + I
+                local S = holoEntity(Index)
+                if (S) { holoAng(Index, slewAng(S:angles(), STar, TorsoTurnRate, Dt)) }
+            }
         } else {
-            local StowAng = shoulderStowAng()
+            local StowQ = quat(shoulderStowAng())
             local T = clamp(Shoulder_Stow_Speed/100, 0.01, 1)
-            if (ShoulderHoloReady1) { holoAng(13, slerp(quat(holoEntity(13):angles()), quat(StowAng), T):toAngle()) }
-            if (ShoulderHoloReady2) { holoAng(14, slerp(quat(holoEntity(14):angles()), quat(StowAng), T):toAngle()) }
-            if (ShoulderHoloReady3) { holoAng(15, slerp(quat(holoEntity(15):angles()), quat(StowAng), T):toAngle()) }
-            if (ShoulderHoloReady4) { holoAng(16, slerp(quat(holoEntity(16):angles()), quat(StowAng), T):toAngle()) }
+            for (I = 1, 4) {
+                local Index = 12 + I
+                local S = holoEntity(Index)
+                if (S) { holoAng(Index, slerp(quat(S:angles()), StowQ, T):toAngle()) }
+            }
         }
     }
     if (!ShoulderMode & ShoulderStowUntil > 0 & Curtime >= ShoulderStowUntil) { stowShoulders() ShoulderStowUntil = 0 }
@@ -806,15 +845,17 @@ if (first() | dupefinished()) {
             soundPitch(30, 45)
             soundVolume(30, 0)
             BoostSoundPlaying = 1
+            EngineVolLast = -1
         }
         local BoostTarget = BoostAny ? EngineVolume : 0
         EngineCurrentVol = EngineCurrentVol + (BoostTarget - EngineCurrentVol)*0.25
         if (EngineCurrentVol < 0.002) { EngineCurrentVol = 0 }
-        if (BoostSoundPlaying) {
+        if (BoostSoundPlaying & (abs(EngineCurrentVol - EngineVolLast) > 0.002)) {
             soundVolume(30, EngineCurrentVol)
             soundPitch(30, clamp(45 + (EngineCurrentVol/max(EngineVolume, 0.01))*45, 30, 130))
+            EngineVolLast = EngineCurrentVol
         }
-        if (!BoostAny & BoostSoundPlaying & EngineCurrentVol == 0) { soundStop(30) BoostSoundPlaying = 0 }
+        if (!BoostAny & BoostSoundPlaying & EngineCurrentVol == 0) { soundStop(30) BoostSoundPlaying = 0 EngineVolLast = -1 }
         BoostWasOn = BoostAny
 
         if (!SlideReady) {
@@ -828,8 +869,13 @@ if (first() | dupefinished()) {
         SlideVol = SlideVol + (SlideTargetVol - SlideVol)*0.15
         if (SlideVol < 0.002) { SlideVol = 0 }
         if (SlideReady) {
-            soundVolume(31, SlideVol)
-            soundPitch(31, clamp(SlidePitchMin + (GroundSpeed2/SpeedRef)*(SlidePitchMax - SlidePitchMin), SlidePitchMin, SlidePitchMax))
+            local SPitch = clamp(SlidePitchMin + (GroundSpeed2/SpeedRef)*(SlidePitchMax - SlidePitchMin), SlidePitchMin, SlidePitchMax)
+            if ((abs(SlideVol - SlideVolLast) > 0.002) | (abs(SPitch - SlidePitchLast) > 0.5)) {
+                soundVolume(31, SlideVol)
+                soundPitch(31, SPitch)
+                SlideVolLast = SlideVol
+                SlidePitchLast = SPitch
+            }
         }
     }
 }
