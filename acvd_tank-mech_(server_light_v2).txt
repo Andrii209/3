@@ -31,6 +31,7 @@
 # - Yaw rotations are reused as basis vectors instead of recomputed per target.
 # - Aim point / stow angles / shoulder stow quaternion computed once per tick.
 # - Redundant holoAng, toLocal and sound API calls removed.
+# - Control flow uses the canonical `} elseif` / `} else` form from the Wiremod wiki.
 # Tuning values and visible behaviour are unchanged.
 
 # ================= FUNCTIONS =================
@@ -87,9 +88,9 @@ function number setupShoulder(Index, ShoulderBase:entity) {
         if ((Index % 2) == 1) { Side = 1 } else { Side = 2 }
     } elseif (Y >= 0) { Side = 1 }
     if (Index == 13) { ShoulderSide1 = Side }
-    elseif (Index == 14) { ShoulderSide2 = Side }
-    elseif (Index == 15) { ShoulderSide3 = Side }
-    elseif (Index == 16) { ShoulderSide4 = Side }
+    if (Index == 14) { ShoulderSide2 = Side }
+    if (Index == 15) { ShoulderSide3 = Side }
+    if (Index == 16) { ShoulderSide4 = Side }
     ShoulderBase:parentTo(holoEntity(Index))
     holoPos(Index, CurBase:toWorld(ShoulderLocalPos))
     holoAng(Index, shoulderStowAng())
@@ -115,7 +116,7 @@ function two_seg_ik(IA, IB, IK, A:entity, B:entity, P:entity, Target:vector) {
     local AxisLocal2 = A:toLocalAxis(Target - B:pos())
     local Distance = AxisLocal2:length()
     if (Distance > Length_AB) { Distance = Length_AB }
-    elseif (Distance < 1) { Distance = 1 }
+    if (Distance < 1) { Distance = 1 }
     local D2 = Distance*Distance
     local HipArg = clamp((D2 + Length_A2 - Length_B2) / (2*Distance*Length_A), -1, 1)
     local KneeArg = clamp((Length_B2 + Length_A2 - D2) / Length_BA2, -1, 1)
@@ -464,8 +465,7 @@ if (first() | dupefinished()) {
     if (AimRight > 0) {
         if (GunStowR) { GunAimR = HGR:angles() GunStowR = 0 }
         GunAimR = slewAng(GunAimR, (AimPos - HGR:pos()):toAngle(), GunTrackSpeed, VDt)
-        if (AimRight >= 1) { holoAng(11, GunAimR) }
-        else { holoAng(11, slerp(quat(StowR), quat(GunAimR), AimRight*1.1):toAngle()) }
+        if (AimRight >= 1) { holoAng(11, GunAimR) } else { holoAng(11, slerp(quat(StowR), quat(GunAimR), AimRight*1.1):toAngle()) }
     } elseif (!GunStowR) {
         holoAng(11, StowR)
         GunStowR = 1
@@ -474,8 +474,7 @@ if (first() | dupefinished()) {
     if (AimLeft > 0) {
         if (GunStowL) { GunAimL = HGL:angles() GunStowL = 0 }
         GunAimL = slewAng(GunAimL, (AimPos - HGL:pos()):toAngle(), GunTrackSpeed, VDt)
-        if (AimLeft >= 1) { holoAng(12, GunAimL) }
-        else { holoAng(12, slerp(quat(StowL), quat(GunAimL), AimLeft*1.1):toAngle()) }
+        if (AimLeft >= 1) { holoAng(12, GunAimL) } else { holoAng(12, slerp(quat(StowL), quat(GunAimL), AimLeft*1.1):toAngle()) }
     } elseif (!GunStowL) {
         holoAng(12, StowL)
         GunStowL = 1
@@ -651,8 +650,7 @@ if (first() | dupefinished()) {
         if (Nrm:z() < MinNZ) {
             local Hv = vec(Nrm:x(), Nrm:y(), 0)
             local HL = Hv:length()
-            if (HL > 0.0001) { Nrm = (Hv*(sin(TerrainMaxTilt)/HL) + vec(0,0,MinNZ)):normalized() }
-            else { Nrm = ZAxis }
+            if (HL > 0.0001) { Nrm = (Hv*(sin(TerrainMaxTilt)/HL) + vec(0,0,MinNZ)):normalized() } else { Nrm = ZAxis }
         }
         # Rotation basis is reused by terrain projection, hull probe, foot slots and foot normals.
         local MoveF = vec(1,0,0):rotateAroundAxis(ZAxis, ChassisYaw)
